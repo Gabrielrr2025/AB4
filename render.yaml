@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pdf-to-excel-app-lite
+    env: python
+    plan: free
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install --prefer-binary -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+    envVars:
+      - key: PIP_DISABLE_PIP_VERSION_CHECK
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+files:
+  - path: runtime.txt
+    contents: python-3.11.9
