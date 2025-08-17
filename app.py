@@ -8,12 +8,19 @@ from pypdf import PdfReader
 import streamlit as st
 import xlsxwriter
 
+# =========================
+# Config
+# =========================
 st.set_page_config(page_title="PDF → Excel (Lite)", page_icon="🪶", layout="wide")
 st.title("🪶 PDF → Excel (Lite)")
-st.caption("Parser robusto para Curva ABC (Lince) — pypdf + xlsxwriter. Busca, paginação, checkboxes e Top N por valor.")
+st.caption("Parser robusto (sem pandas/pdfplumber) — pypdf + xlsxwriter. Nomes limpos, busca, paginação, seleção.")
 
+# -------------------------
+# Utilidades
+# -------------------------
 def br_to_float(txt: str):
-    if txt is None:
+    """Converte '1.234,56' → 1234.56; e '1,234.56' → 1234.56."""
+    if not txt:
         return None
     t = txt.strip()
     if not t:
@@ -30,6 +37,28 @@ def br_to_float(txt: str):
     except Exception:
         return None
 
+def is_num_token(tok: str) -> bool:
+    return bool(re.fullmatch(r"[0-9][0-9\.\,]*", tok or ""))
+
+def dec_places(tok: str) -> int:
+    if not tok:
+        return 0
+    s = tok.replace(".", ",")
+    if "," in s:
+        return len(s.split(",")[-1])
+    return 0
+
+def extract_text_with_pypdf(file) -> str:
+    """Extrai texto de todas as páginas (tolerante a erros)."""
+    reader = PdfReader(file)
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            texts.append("")
+    return "\n".join(texts)
+
 def guess_setor(text: str, filename: str) -> str:
     m = re.search(r"Departamento:\s*([\s\S]{0,60})", text, flags=re.IGNORECASE)
     if m:
@@ -40,35 +69,16 @@ def guess_setor(text: str, filename: str) -> str:
                 return t
     base = os.path.basename(filename or "")
     base_up = base.upper()
-    for chave in ["FRIOS", "ACOUGUE", "AÇOUGUE", "PADARIA", "HORTIFRUTI", "BEBIDAS", "MERCEARIA", "LANCHONETE"]:
+    for chave in ["FRIOS","ACOUGUE","AÇOUGUE","PADARIA","HORTIFRUTI","BEBIDAS","MERCEARIA","LANCHONETE"]:
         if chave in base_up:
-            start = base_up.find(chave)
-            end = min(len(base_up), start + len(chave) + 2)
-            return re.sub(r"[^A-Z0-9]", "", base_up[start:end])
+            return chave
     return "N/D"
 
-def extract_text_with_pypdf(file) -> str:
-    reader = PdfReader(file)
-    texts = []
-    for page in reader.pages:
-        try:
-            texts.append(page.extract_text() or "")
-        except Exception:
-            texts.append("")
-    return "\n".join(texts)
-
-def is_num_token(tok: str) -> bool:
-    return re.fullmatch(r"[0-9][0-9\.\,]*", tok or "") is not None
-
-def dec_places(tok: str) -> int:
-    if tok is None:
-        return 0
-    s = tok.replace(".", ",")
-    if "," in s:
-        return len(s.split(",")[-1])
-    return 0
-
 def glue_wrapped_lines(lines):
+    """
+    Une linhas quebradas: se a linha atual não tem tail numérico (>=2 tokens numéricos no fim)
+    e a próxima é majoritariamente numérica, concatena.
+    """
     glued = []
     i = 0
     while i < len(lines):
@@ -76,11 +86,13 @@ def glue_wrapped_lines(lines):
         nxt = lines[i+1] if i + 1 < len(lines) else ""
         cur_toks = cur.split()
         nxt_toks = nxt.split()
+
         j = len(cur_toks)
         while j > 0 and is_num_token(cur_toks[j-1]):
             j -= 1
         cur_tail_len = len(cur_toks) - j
         nxt_num_ratio = (sum(1 for t in nxt_toks if is_num_token(t)) / max(1, len(nxt_toks))) if nxt_toks else 0.0
+
         if cur_tail_len < 2 and nxt_num_ratio >= 0.5:
             glued.append((cur + " " + nxt).strip())
             i += 2
@@ -90,11 +102,16 @@ def glue_wrapped_lines(lines):
     return glued
 
 def clean_tokens(tokens):
-    """Remove EAN (>=12 dígitos) e o 1º token numérico curto (código do item)."""
+    """
+    Remove:
+      - EAN/GTIN (12+ dígitos) em qualquer posição
+      - 1º token numérico curto no início (código do item, ex.: 4051)
+    Mantém tokens 'mistos' de nome (ex.: '200ML', 'UN', 'KG') porque têm letras.
+    """
     out = []
     removed_leading_code = False
     for idx, t in enumerate(tokens):
-        if re.fullmatch(r"\d{12,}", t):  # EAN/GTIN em qualquer lugar
+        if re.fullmatch(r"\d{12,}", t):  # EAN em qualquer lugar
             continue
         if not removed_leading_code and idx == 0 and re.fullmatch(r"\d{3,6}", t):
             removed_leading_code = True
@@ -103,18 +120,26 @@ def clean_tokens(tokens):
     return out
 
 def parse_lince_lines_to_list(text: str):
+    """
+    Extrai itens do relatório Curva ABC (Lince):
+      - normaliza, remove cabeçalhos/rodapés;
+      - cola linhas quebradas;
+      - limpa EAN/código do começo;
+      - identifica tail numérico no fim e pega (quantidade, valor) corretos;
+      - nome = head textual (sem números do tail).
+    Retorna: lista de dicts {"nome","quantidade","valor"} ordenada por 'valor' desc.
+    """
     # 1) normaliza e remove cabeçalhos/rodapés
     lines = [re.sub(r"\s{2,}", " ", (ln or "")).strip() for ln in text.splitlines()]
-    lixo = ("Curva ABC", "Período", "CST", "ECF", "Situação Tributária",
-            "Classif.", "Codigo", "CÓDIGO", "Barras", "Total do Departamento",
-            "Total Geral", "www.grupotecnoweb.com.br")
+    lixo = ("Curva ABC","Período","CST","ECF","Situação Tributária","Classif.","Codigo","CÓDIGO",
+            "Barras","Total do Departamento","Total Geral","www.grupotecnoweb.com.br")
     lines = [ln for ln in lines if ln and not any(k in ln for k in lixo)]
 
-    # 2) limpa EAN/código final e cola linhas quebradas
+    # 2) remove EAN/código no final; cola linhas
     cleaned = []
     for ln in lines:
-        ln = re.sub(r"\b\d{8,13}\b\s*$", "", ln).strip()
-        ln = re.sub(r"\b\d{4,8}\b\s*$", "", ln).strip()
+        ln = re.sub(r"\b\d{8,13}\b\s*$", "", ln).strip()   # EAN no final
+        ln = re.sub(r"\b\d{4,8}\b\s*$", "", ln).strip()    # código no final
         cleaned.append(ln)
     cleaned = glue_wrapped_lines(cleaned)
 
@@ -123,11 +148,11 @@ def parse_lince_lines_to_list(text: str):
         toks = ln.split()
         if not toks:
             continue
-        toks = clean_tokens(toks)
+        toks = clean_tokens(toks)  # remove código inicial e EANs internos
         if not toks:
             continue
 
-        # encontra início do TAIL numérico contíguo no fim
+        # acha início do tail numérico contíguo no fim
         idx = len(toks)
         while idx > 0 and is_num_token(toks[idx-1]):
             idx -= 1
@@ -137,46 +162,44 @@ def parse_lince_lines_to_list(text: str):
         if len(tail) < 2 or not head:
             continue
 
-        # Candidates de VALOR = tokens com exatamente 2 casas decimais
-        cand_valores = [i for i, t in enumerate(tail) if dec_places(t) == 2]
-        if not cand_valores:
-            # fallback: usa último número como 'valor' e anterior como 'qtd'
-            qtd = br_to_float(tail[-2]); valor = br_to_float(tail[-1])
-            if qtd is None or valor is None or qtd < 0 or valor < 0:
-                continue
-            nome = " ".join(head).strip()
-            if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", nome):
-                continue
-            items_raw.append({"nome": nome, "quantidade": float(qtd), "valor": float(valor)})
-            continue
-
-        # escolhe o "valor" mais à direita ENTRE os que têm 2 casas (costuma ser o total)
-        i_valor = cand_valores[-1]
-        valor = br_to_float(tail[i_valor])
-        if valor is None or valor < 0:
-            continue
-
-        # quantidade: procure à esquerda do valor o 1º token com 3 casas decimais; se não achar, pegue o nº válido mais próximo
-        i_qtd = None
-        for j in range(i_valor - 1, -1, -1):
-            if dec_places(tail[j]) == 3:
-                i_qtd = j
-                break
-        if i_qtd is None:
-            for j in range(i_valor - 1, -1, -1):
-                if is_num_token(tail[j]) and br_to_float(tail[j]) is not None:
+        # Candidato a VALOR: token com 2 casas decimais mais à direita
+        cand_valores = [i for i, t in enumerate(tail) if dec_places(t) == 2 and br_to_float(t) is not None]
+        if cand_valores:
+            i_val = cand_valores[-1]
+            valor = br_to_float(tail[i_val])
+            # QTD: procurar à esquerda do valor um token com 3 casas decimais; senão, pegar o válido mais próximo
+            i_qtd = None
+            for j in range(i_val - 1, -1, -1):
+                if dec_places(tail[j]) == 3 and br_to_float(tail[j]) is not None:
                     i_qtd = j
                     break
+            if i_qtd is None:
+                for j in range(i_val - 1, -1, -1):
+                    if br_to_float(tail[j]) is not None:
+                        i_qtd = j
+                        break
+            if i_qtd is None or valor is None:
+                continue
+            qtd = br_to_float(tail[i_qtd])
+        else:
+            # fallback: usa os 2 últimos números como qtd/valor
+            qtd = br_to_float(tail[-2])
+            valor = br_to_float(tail[-1])
 
-        if i_qtd is None:
+        if qtd is None or valor is None or qtd < 0 or valor < 0:
             continue
 
-        qtd = br_to_float(tail[i_qtd])
-        if qtd is None or qtd < 0:
-            continue
+        # Nome: somente head textual; filtra "números soltos" que eventualmente ficaram no head
+        # (mantém tokens com letras, como 200ML/UN/KG)
+        head_clean = []
+        for t in head:
+            if is_num_token(t):
+                continue  # elimina número puro perdido no head
+            head_clean.append(t)
+        nome = " ".join(head_clean).strip()
 
-        nome = " ".join(head).strip()
-        if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", nome):
+        # sanity: precisa ter letras
+        if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", nome):
             continue
 
         items_raw.append({"nome": nome, "quantidade": float(qtd), "valor": float(valor)})
@@ -193,12 +216,17 @@ def parse_lince_lines_to_list(text: str):
     # ordena por valor desc
     return sorted(agg.values(), key=lambda x: x["valor"], reverse=True)
 
-# ===== Inputs =====
+# -------------------------
+# Inputs
+# -------------------------
 uploaded = st.file_uploader("Envie o PDF (Curva ABC do Lince)", type=["pdf"])
 default_mes = datetime.today().strftime("%m/%Y")
 mes = st.text_input("Mês (ex.: 08/2025)", value=default_mes, help="Use MM/AAAA")
 semana = st.text_input("Semana (ex.: 1ª semana de ago/2025)", value="", help="Como deve aparecer no Excel")
 
+# -------------------------
+# UI + Geração
+# -------------------------
 if uploaded:
     all_text = extract_text_with_pypdf(uploaded)
     setor_guess = guess_setor(all_text, uploaded.name)
@@ -267,7 +295,7 @@ if uploaded:
         nome = r["nome"]; qtd = round(float(r["quantidade"]), 3); val = round(float(r["valor"]), 2)
         csel, cprod, cqtd, cval = box.columns([0.6, 4.0, 1.4, 1.4])
         st.session_state.selecao[nome] = csel.checkbox("", value=st.session_state.selecao.get(nome, True), key=f"chk_{nome}")
-        cprod.text(nome)
+        cprod.text(nome)  # <<<<<< NOME LIMPO, sem números extras
         cqtd.text(f"{qtd:,.3f}".replace(",", "X").replace(".", ",").replace("X", "."))
         cval.text(f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
@@ -303,4 +331,5 @@ if uploaded:
         )
 else:
     st.info("Envie um PDF para começar.")
+
 
