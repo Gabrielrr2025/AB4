@@ -151,100 +151,915 @@ def glue_wrapped_lines(lines):
 def parse_lince_lines_to_list(text: str):
     """
     Extrai itens do relatório 'Curva ABC' (Lince).
-    Estratégia melhorada para capturar produtos corretamente.
+    Estratégia específica para o formato: 
+    [classif] [codigo_barras] [codigo] [NOME PRODUTO] [custo] [qtd] [valor] [valor_acum] [%] [%_acum] [preco_venda]
     """
-    # 1) normaliza
+    produtos = []
     lines = [re.sub(r"\s{2,}", " ", (ln or "")).strip() for ln in text.splitlines()]
     
-    # Remove cabeçalhos/rodapés mais específicos
-    lixo = [
+    # Remove cabeçalhos/rodapés específicos
+    lixo_keywords = [
         "Curva ABC", "Período", "CST", "ECF", "Situação Tributária",
-        "Classif.", "Codigo", "CÓDIGO", "Barras", "Total do Departamento",
+        "Classif.", "Codigo", "Barras", "Total do Departamento",
         "Total Geral", "www.grupotecnoweb.com.br", "Lince", "SHOPPING DO PAO",
         "Pag.", "Por Valor", "Departamento:", "Custo", "Pco. Médio",
-        "Qtde", "Valor", "Vl. Acum", "Acum.", "R$", "Produto", "Venda"
+        "Qtde", "Valor", "Vl. Acum", "Acum.", "Produto", "Venda"
     ]
-    lines = [ln for ln in lines if ln and not any(k in ln for k in lixo)]
-
-    # 2) remove EAN/código no final e cola linhas quebradas
-    cleaned = []
+    
     for ln in lines:
-        ln = re.sub(r"\b\d{8,13}\b\s*$", "", ln).strip()  # EAN
-        ln = re.sub(r"\b\d{4,8}\b\s*$", "", ln).strip()   # código interno
-        cleaned.append(ln)
-    cleaned = glue_wrapped_lines(cleaned)
-
-    # 3) parse linha → tail numérico e nome
-    items_raw = []
-    for ln in cleaned:
-        toks = ln.split()
-        if not toks:
+        if not ln or len(ln) < 20:  # muito curta
             continue
-
-        # encontra início do TAIL numérico contíguo no fim
-        idx = len(toks)
-        while idx > 0 and is_num_token(toks[idx-1]):
-            idx -= 1
-        tail = toks[idx:]
-        head = toks[:idx]
-
-        # precisamos de pelo menos 2 números no tail (qtd & valor)
-        if len(tail) < 2 or not head:
+            
+        # Pula linhas que são claramente cabeçalhos/rodapés
+        if any(k.lower() in ln.lower() for k in lixo_keywords):
             continue
+            
+        # Regex específico para o formato do Lince
+        # Padrão: [num] [codigo_barras_13_digitos] [codigo_4_digitos] [NOME] [valores...]
+        pattern = r'^(\d+)\s+(\d{13})\s+(\d{4,8})\s+(.+?)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)(?:\s+.+)?
 
-        # heurística de ordem: alguns relatórios vêm [preço] [quantidade] [valor]
-        # outros podem vir [quantidade] [valor] direto.
-        # Tentamos interpretar os dois últimos números como (quantidade, valor) e
-        # se "valor" parecer inteiro sem decimais, trocamos.
-        qtd_token = tail[-2]
-        valor_token = tail[-1]
+# -------------------------
+# Interface Principal
+# -------------------------
+uploaded = st.file_uploader("📁 Envie o PDF (Curva ABC do Lince)", type=["pdf"])
 
-        qtd = br_to_float(qtd_token)
-        valor = br_to_float(valor_token)
+# Interface melhorada para configurações
+st.subheader("⚙️ Configurações do Relatório")
 
-        # Se "valor" não tiver 2 decimais e "qtd" tiver, invertemos
-        def dec_places(tok):
-            s = tok.replace(".", "").split(",")
-            if len(s) == 2:
-                return len(s[1])
-            s = tok.split(".")
-            if len(s) == 2:
-                return len(s[1])
-            return 0
+col1, col2, col3 = st.columns(3)
 
-        if qtd is not None and valor is not None:
-            dq, dv = dec_places(qtd_token), dec_places(valor_token)
-            if dv not in (2,) and dq in (2,):  # provável inversão
-                qtd, valor = valor, qtd
+with col1:
+    # Mês dropdown
+    meses = [
+        "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+        "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+    ]
+    mes_atual = datetime.now().month - 1
+    mes_selecionado = st.selectbox("📅 Mês", options=meses, index=mes_atual)
 
-        if qtd is None or valor is None or qtd < 0 or valor < 0:
-            continue
+with col2:
+    # Semana como número
+    semana = st.selectbox("📊 Semana", options=[1, 2, 3, 4], index=0)
 
-        nome = " ".join(head).strip()
+with col3:
+    # Setor será preenchido após upload do PDF
+    setor_placeholder = st.empty()
+
+# -------------------------
+# Processamento + UI
+# -------------------------
+if uploaded:
+    # Extrai texto do PDF
+    with st.spinner("🔄 Processando PDF..."):
+        all_text = extract_text_with_pypdf(uploaded)
+    
+    # Detecta setor automaticamente
+    setor_guess = guess_setor(all_text, uploaded.name)
+    
+    # Dropdown para setor
+    with col3:
+        try:
+            setor_index = SETORES_VALIDOS.index(setor_guess)
+        except ValueError:
+            setor_index = 6  # Lanchonete como padrão
+        setor = st.selectbox("🏪 Setor", options=SETORES_VALIDOS, index=setor_index)
+
+    # Parse dos produtos
+    with st.spinner("🔍 Analisando produtos..."):
+        rows_all = parse_lince_lines_to_list(all_text)
+    
+    if not rows_all:
+        st.error("❌ Não consegui identificar produtos neste PDF.")
+        with st.expander("🔍 Ver texto extraído (debug)"):
+            st.code(all_text[:2000])
+        st.stop()
+
+    st.success(f"✅ {len(rows_all)} produtos detectados!")
+
+    # ----- Controles de Busca e Filtros -----
+    st.subheader("🔍 Busca e Filtros")
+    
+    col_search, col_order = st.columns([2, 1])
+    with col_search:
+        q = st.text_input("🔎 Buscar produto (contém):", value="").strip().upper()
+    with col_order:
+        order = st.selectbox("📊 Ordenar por", ["valor (desc)", "quantidade (desc)", "nome (A→Z)"], index=0)
+
+    # Aplica busca
+    if q:
+        rows = [r for r in rows_all if q in r["nome"].upper()]
+        if not rows:
+            st.warning(f"Nenhum produto encontrado com '{q}'")
+    else:
+        rows = rows_all[:]
+
+    # Aplica ordenação
+    if order.startswith("valor"):
+        rows.sort(key=lambda x: x["valor"], reverse=True)
+    elif order.startswith("quantidade"):
+        rows.sort(key=lambda x: x["quantidade"], reverse=True)
+    else:
+        rows.sort(key=lambda x: x["nome"])
+
+    # ----- Paginação -----
+    col_page1, col_page2, col_page3 = st.columns([1, 1, 2])
+    with col_page1:
+        page_size = st.selectbox("📄 Itens por página", [20, 50, 100], index=0)
+    
+    total = len(rows)
+    pages = max(1, ceil(total / page_size))
+    
+    with col_page2:
+        page = st.number_input("Página", min_value=1, max_value=pages, value=1, step=1)
+    with col_page3:
+        st.info(f"📊 **{total}** produtos encontrados (de {len(rows_all)} detectados)")
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = rows[start:end]
+
+    # ----- Seleção (checkboxes com session_state) -----
+    st.subheader("✅ Seleção de Produtos")
+    
+    if "selecao" not in st.session_state:
+        st.session_state.selecao = {}
+
+    # Inicializa chaves da página atual se não existirem
+    for r in page_rows:
+        st.session_state.selecao.setdefault(r["nome"], True)  # pré-selecionado
+
+    # Controles de seleção
+    col_sel1, col_sel2, col_sel3, col_sel4 = st.columns(4)
+    with col_sel1:
+        if st.button("✅ Selecionar todos (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = True
+    with col_sel2:
+        if st.button("❌ Limpar seleção (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = False
+    with col_sel3:
+        top_n = st.number_input("🎯 Top N por valor (global)", min_value=0, max_value=len(rows_all), value=10, step=1)
+    with col_sel4:
+        if st.button("🎯 Aplicar Top N"):
+            # Recria seleção: tudo False + Top N True
+            st.session_state.selecao = {r["nome"]: False for r in rows_all}
+            for r in rows_all[:top_n]:
+                st.session_state.selecao[r["nome"]] = True
+
+    # Info sobre seleção atual
+    selecionados_count = sum(1 for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    valor_selecionado = sum(r['valor'] for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    
+    if selecionados_count > 0:
+        st.info(f"📊 **{selecionados_count}** produtos selecionados | Valor total: **R$ {valor_selecionado:,.2f}**".replace(',', 'X').replace('.', ',').replace('X', '.'))
+
+    # ----- Tabela de Produtos -----
+    st.markdown("---")
+    
+    # Cabeçalho da "tabela"
+    hdr = st.container()
+    with hdr:
+        h1, h2, h3, h4 = st.columns([0.6, 4.5, 1.4, 1.5])
+        h1.markdown("**Sel.**")
+        h2.markdown("**Produto**")
+        h3.markdown("**Quantidade**")
+        h4.markdown("**Valor (R$)**")
+
+    # Linhas da página
+    box = st.container()
+    for r in page_rows:
+        nome = r["nome"]
+        qtd = round(float(r["quantidade"]), 3)
+        val = round(float(r["valor"]), 2)
+        csel, cprod, cqtd, cval = box.columns([0.6, 4.5, 1.4, 1.5])
+        st.session_state.selecao[nome] = csel.checkbox(
+            label="",
+            value=st.session_state.selecao.get(nome, True),
+            key=f"chk_{nome}_{page}"  # inclui página para evitar conflitos
+        )
+        cprod.text(nome)
+        cqtd.text(f"{qtd:,.3f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        cval.text(f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    # ----- Geração do Excel -----
+    st.markdown("---")
+    st.subheader("📊 Gerar Excel")
+    
+    col_excel1, col_excel2 = st.columns([3, 1])
+    
+    with col_excel2:
+        st.write("") # espaço
+        if st.button("📊 **Gerar Excel**", type="primary", use_container_width=True):
+            selecionados = [r for r in rows_all if st.session_state.selecao.get(r['nome'], False)]
+            if not selecionados:
+                st.warning("⚠️ Selecione pelo menos um produto.")
+                st.stop()
+
+            # Prepara arquivo Excel
+            output = io.BytesIO()
+            workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+            ws = workbook.add_worksheet("Produtos")
+
+            # Cabeçalhos conforme especificação
+            headers = ["nome do produto", "setor", "mês", "semana", "quantidade", "valor"]
+            for col, h in enumerate(headers):
+                ws.write(0, col, h)
+
+            # Dados dos produtos selecionados
+            for i, r in enumerate(selecionados, start=1):
+                ws.write(i, 0, r["nome"])
+                ws.write(i, 1, setor)
+                ws.write(i, 2, mes_selecionado)
+                ws.write(i, 3, semana)
+                ws.write_number(i, 4, round(float(r["quantidade"]), 3))
+                ws.write_number(i, 5, round(float(r["valor"]), 2))
+
+            # Formatação
+            fmt_money = workbook.add_format({'num_format': 'R$ #,##0.00'})
+            fmt_qty = workbook.add_format({'num_format': '#,##0.000'})
+            
+            ws.set_column(0, 0, 50)   # nome do produto
+            ws.set_column(1, 1, 18)   # setor
+            ws.set_column(2, 2, 15)   # mês
+            ws.set_column(3, 3, 10)   # semana
+            ws.set_column(4, 4, 15, fmt_qty)   # quantidade
+            ws.set_column(5, 5, 15, fmt_money) # valor
+
+            workbook.close()
+            
+            # Nome do arquivo conforme especificação
+            nome_arquivo = f"produtos_{setor.lower().replace(' ', '_')}_{mes_selecionado.lower()}_semana{semana}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            
+            st.success("✅ Excel gerado com sucesso!")
+            st.download_button(
+                label="⬇️ Baixar Excel",
+                data=output.getvalue(),
+                file_name=nome_arquivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with col_excel1:
+        if selecionados_count > 0:
+            st.write("**Preview do Excel:**")
+            preview_df = []
+            for r in rows_all[:5]:  # mostra apenas os 5 primeiros
+                if st.session_state.selecao.get(r['nome'], False):
+                    preview_df.append({
+                        "nome do produto": r["nome"],
+                        "setor": setor,
+                        "mês": mes_selecionado,
+                        "semana": semana,
+                        "quantidade": round(r["quantidade"], 3),
+                        "valor": round(r["valor"], 2)
+                    })
+            
+            if preview_df:
+                st.table(preview_df)
+                if len(preview_df) < selecionados_count:
+                    st.caption(f"... e mais {selecionados_count - len(preview_df)} produtos")
+
+else:
+    # Tela inicial com instruções
+    st.info("📋 **Como usar:**")
+    st.markdown("""
+    1. 📄 **Faça upload** do PDF com relatório 'Curva ABC' do sistema Lince
+    2. ⚙️ **Configure** o mês, semana e setor (detectado automaticamente)
+    3. 🔍 **Use a busca** para encontrar produtos específicos
+    4. ✅ **Selecione** os produtos que deseja exportar (use Top N para facilitar)
+    5. 📊 **Gere** o arquivo Excel com as colunas especificadas
+    
+    **Colunas do Excel:** nome do produto, setor, mês, semana, quantidade, valor
+    """)
+    
+    # Exemplo visual dos setores
+    st.markdown("---")
+    st.markdown("### 🏪 Setores Disponíveis:")
+    cols = st.columns(4)
+    for i, setor in enumerate(SETORES_VALIDOS):
+        cols[i % 4].markdown(f"• {setor}")
+
+        match = re.match(pattern, ln)
         
-        # Remove classificação numérica do início se existir
-        nome = re.sub(r"^\d+\s+", "", nome).strip()
+        if match:
+            classificacao = match.group(1)
+            codigo_barras = match.group(2)
+            codigo = match.group(3)
+            nome = match.group(4).strip()
+            custo = br_to_float(match.group(5))
+            quantidade = br_to_float(match.group(6))
+            valor = br_to_float(match.group(7))
+            
+            # Validações
+            if not nome or len(nome) < 3:
+                continue
+            if quantidade is None or quantidade <= 0:
+                continue
+            if valor is None or valor <= 0:
+                continue
+            if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", nome):
+                continue
+                
+            produtos.append({
+                "nome": nome,
+                "quantidade": float(quantidade),
+                "valor": float(valor)
+            })
+            continue
         
-        # Verifica se tem conteúdo válido
+        # Padrão alternativo mais flexível (caso a regex específica falhe)
+        tokens = ln.split()
+        if len(tokens) < 7:
+            continue
+            
+        # Procura por código de barras (13 dígitos) no início
+        barcode_idx = -1
+        for i, token in enumerate(tokens[:3]):  # procura nos primeiros 3 tokens
+            if re.match(r'^\d{13}
+
+# -------------------------
+# Interface Principal
+# -------------------------
+uploaded = st.file_uploader("📁 Envie o PDF (Curva ABC do Lince)", type=["pdf"])
+
+# Interface melhorada para configurações
+st.subheader("⚙️ Configurações do Relatório")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    # Mês dropdown
+    meses = [
+        "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+        "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+    ]
+    mes_atual = datetime.now().month - 1
+    mes_selecionado = st.selectbox("📅 Mês", options=meses, index=mes_atual)
+
+with col2:
+    # Semana como número
+    semana = st.selectbox("📊 Semana", options=[1, 2, 3, 4], index=0)
+
+with col3:
+    # Setor será preenchido após upload do PDF
+    setor_placeholder = st.empty()
+
+# -------------------------
+# Processamento + UI
+# -------------------------
+if uploaded:
+    # Extrai texto do PDF
+    with st.spinner("🔄 Processando PDF..."):
+        all_text = extract_text_with_pypdf(uploaded)
+    
+    # Detecta setor automaticamente
+    setor_guess = guess_setor(all_text, uploaded.name)
+    
+    # Dropdown para setor
+    with col3:
+        try:
+            setor_index = SETORES_VALIDOS.index(setor_guess)
+        except ValueError:
+            setor_index = 6  # Lanchonete como padrão
+        setor = st.selectbox("🏪 Setor", options=SETORES_VALIDOS, index=setor_index)
+
+    # Parse dos produtos
+    with st.spinner("🔍 Analisando produtos..."):
+        rows_all = parse_lince_lines_to_list(all_text)
+    
+    if not rows_all:
+        st.error("❌ Não consegui identificar produtos neste PDF.")
+        with st.expander("🔍 Ver texto extraído (debug)"):
+            st.code(all_text[:2000])
+        st.stop()
+
+    st.success(f"✅ {len(rows_all)} produtos detectados!")
+
+    # ----- Controles de Busca e Filtros -----
+    st.subheader("🔍 Busca e Filtros")
+    
+    col_search, col_order = st.columns([2, 1])
+    with col_search:
+        q = st.text_input("🔎 Buscar produto (contém):", value="").strip().upper()
+    with col_order:
+        order = st.selectbox("📊 Ordenar por", ["valor (desc)", "quantidade (desc)", "nome (A→Z)"], index=0)
+
+    # Aplica busca
+    if q:
+        rows = [r for r in rows_all if q in r["nome"].upper()]
+        if not rows:
+            st.warning(f"Nenhum produto encontrado com '{q}'")
+    else:
+        rows = rows_all[:]
+
+    # Aplica ordenação
+    if order.startswith("valor"):
+        rows.sort(key=lambda x: x["valor"], reverse=True)
+    elif order.startswith("quantidade"):
+        rows.sort(key=lambda x: x["quantidade"], reverse=True)
+    else:
+        rows.sort(key=lambda x: x["nome"])
+
+    # ----- Paginação -----
+    col_page1, col_page2, col_page3 = st.columns([1, 1, 2])
+    with col_page1:
+        page_size = st.selectbox("📄 Itens por página", [20, 50, 100], index=0)
+    
+    total = len(rows)
+    pages = max(1, ceil(total / page_size))
+    
+    with col_page2:
+        page = st.number_input("Página", min_value=1, max_value=pages, value=1, step=1)
+    with col_page3:
+        st.info(f"📊 **{total}** produtos encontrados (de {len(rows_all)} detectados)")
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = rows[start:end]
+
+    # ----- Seleção (checkboxes com session_state) -----
+    st.subheader("✅ Seleção de Produtos")
+    
+    if "selecao" not in st.session_state:
+        st.session_state.selecao = {}
+
+    # Inicializa chaves da página atual se não existirem
+    for r in page_rows:
+        st.session_state.selecao.setdefault(r["nome"], True)  # pré-selecionado
+
+    # Controles de seleção
+    col_sel1, col_sel2, col_sel3, col_sel4 = st.columns(4)
+    with col_sel1:
+        if st.button("✅ Selecionar todos (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = True
+    with col_sel2:
+        if st.button("❌ Limpar seleção (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = False
+    with col_sel3:
+        top_n = st.number_input("🎯 Top N por valor (global)", min_value=0, max_value=len(rows_all), value=10, step=1)
+    with col_sel4:
+        if st.button("🎯 Aplicar Top N"):
+            # Recria seleção: tudo False + Top N True
+            st.session_state.selecao = {r["nome"]: False for r in rows_all}
+            for r in rows_all[:top_n]:
+                st.session_state.selecao[r["nome"]] = True
+
+    # Info sobre seleção atual
+    selecionados_count = sum(1 for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    valor_selecionado = sum(r['valor'] for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    
+    if selecionados_count > 0:
+        st.info(f"📊 **{selecionados_count}** produtos selecionados | Valor total: **R$ {valor_selecionado:,.2f}**".replace(',', 'X').replace('.', ',').replace('X', '.'))
+
+    # ----- Tabela de Produtos -----
+    st.markdown("---")
+    
+    # Cabeçalho da "tabela"
+    hdr = st.container()
+    with hdr:
+        h1, h2, h3, h4 = st.columns([0.6, 4.5, 1.4, 1.5])
+        h1.markdown("**Sel.**")
+        h2.markdown("**Produto**")
+        h3.markdown("**Quantidade**")
+        h4.markdown("**Valor (R$)**")
+
+    # Linhas da página
+    box = st.container()
+    for r in page_rows:
+        nome = r["nome"]
+        qtd = round(float(r["quantidade"]), 3)
+        val = round(float(r["valor"]), 2)
+        csel, cprod, cqtd, cval = box.columns([0.6, 4.5, 1.4, 1.5])
+        st.session_state.selecao[nome] = csel.checkbox(
+            label="",
+            value=st.session_state.selecao.get(nome, True),
+            key=f"chk_{nome}_{page}"  # inclui página para evitar conflitos
+        )
+        cprod.text(nome)
+        cqtd.text(f"{qtd:,.3f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        cval.text(f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    # ----- Geração do Excel -----
+    st.markdown("---")
+    st.subheader("📊 Gerar Excel")
+    
+    col_excel1, col_excel2 = st.columns([3, 1])
+    
+    with col_excel2:
+        st.write("") # espaço
+        if st.button("📊 **Gerar Excel**", type="primary", use_container_width=True):
+            selecionados = [r for r in rows_all if st.session_state.selecao.get(r['nome'], False)]
+            if not selecionados:
+                st.warning("⚠️ Selecione pelo menos um produto.")
+                st.stop()
+
+            # Prepara arquivo Excel
+            output = io.BytesIO()
+            workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+            ws = workbook.add_worksheet("Produtos")
+
+            # Cabeçalhos conforme especificação
+            headers = ["nome do produto", "setor", "mês", "semana", "quantidade", "valor"]
+            for col, h in enumerate(headers):
+                ws.write(0, col, h)
+
+            # Dados dos produtos selecionados
+            for i, r in enumerate(selecionados, start=1):
+                ws.write(i, 0, r["nome"])
+                ws.write(i, 1, setor)
+                ws.write(i, 2, mes_selecionado)
+                ws.write(i, 3, semana)
+                ws.write_number(i, 4, round(float(r["quantidade"]), 3))
+                ws.write_number(i, 5, round(float(r["valor"]), 2))
+
+            # Formatação
+            fmt_money = workbook.add_format({'num_format': 'R$ #,##0.00'})
+            fmt_qty = workbook.add_format({'num_format': '#,##0.000'})
+            
+            ws.set_column(0, 0, 50)   # nome do produto
+            ws.set_column(1, 1, 18)   # setor
+            ws.set_column(2, 2, 15)   # mês
+            ws.set_column(3, 3, 10)   # semana
+            ws.set_column(4, 4, 15, fmt_qty)   # quantidade
+            ws.set_column(5, 5, 15, fmt_money) # valor
+
+            workbook.close()
+            
+            # Nome do arquivo conforme especificação
+            nome_arquivo = f"produtos_{setor.lower().replace(' ', '_')}_{mes_selecionado.lower()}_semana{semana}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            
+            st.success("✅ Excel gerado com sucesso!")
+            st.download_button(
+                label="⬇️ Baixar Excel",
+                data=output.getvalue(),
+                file_name=nome_arquivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with col_excel1:
+        if selecionados_count > 0:
+            st.write("**Preview do Excel:**")
+            preview_df = []
+            for r in rows_all[:5]:  # mostra apenas os 5 primeiros
+                if st.session_state.selecao.get(r['nome'], False):
+                    preview_df.append({
+                        "nome do produto": r["nome"],
+                        "setor": setor,
+                        "mês": mes_selecionado,
+                        "semana": semana,
+                        "quantidade": round(r["quantidade"], 3),
+                        "valor": round(r["valor"], 2)
+                    })
+            
+            if preview_df:
+                st.table(preview_df)
+                if len(preview_df) < selecionados_count:
+                    st.caption(f"... e mais {selecionados_count - len(preview_df)} produtos")
+
+else:
+    # Tela inicial com instruções
+    st.info("📋 **Como usar:**")
+    st.markdown("""
+    1. 📄 **Faça upload** do PDF com relatório 'Curva ABC' do sistema Lince
+    2. ⚙️ **Configure** o mês, semana e setor (detectado automaticamente)
+    3. 🔍 **Use a busca** para encontrar produtos específicos
+    4. ✅ **Selecione** os produtos que deseja exportar (use Top N para facilitar)
+    5. 📊 **Gere** o arquivo Excel com as colunas especificadas
+    
+    **Colunas do Excel:** nome do produto, setor, mês, semana, quantidade, valor
+    """)
+    
+    # Exemplo visual dos setores
+    st.markdown("---")
+    st.markdown("### 🏪 Setores Disponíveis:")
+    cols = st.columns(4)
+    for i, setor in enumerate(SETORES_VALIDOS):
+        cols[i % 4].markdown(f"• {setor}")
+, token):
+                barcode_idx = i
+                break
+        
+        if barcode_idx == -1:
+            continue
+            
+        # Procura pelo código interno (4-8 dígitos) logo após o código de barras
+        if barcode_idx + 1 >= len(tokens) or not re.match(r'^\d{4,8}
+
+# -------------------------
+# Interface Principal
+# -------------------------
+uploaded = st.file_uploader("📁 Envie o PDF (Curva ABC do Lince)", type=["pdf"])
+
+# Interface melhorada para configurações
+st.subheader("⚙️ Configurações do Relatório")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    # Mês dropdown
+    meses = [
+        "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+        "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+    ]
+    mes_atual = datetime.now().month - 1
+    mes_selecionado = st.selectbox("📅 Mês", options=meses, index=mes_atual)
+
+with col2:
+    # Semana como número
+    semana = st.selectbox("📊 Semana", options=[1, 2, 3, 4], index=0)
+
+with col3:
+    # Setor será preenchido após upload do PDF
+    setor_placeholder = st.empty()
+
+# -------------------------
+# Processamento + UI
+# -------------------------
+if uploaded:
+    # Extrai texto do PDF
+    with st.spinner("🔄 Processando PDF..."):
+        all_text = extract_text_with_pypdf(uploaded)
+    
+    # Detecta setor automaticamente
+    setor_guess = guess_setor(all_text, uploaded.name)
+    
+    # Dropdown para setor
+    with col3:
+        try:
+            setor_index = SETORES_VALIDOS.index(setor_guess)
+        except ValueError:
+            setor_index = 6  # Lanchonete como padrão
+        setor = st.selectbox("🏪 Setor", options=SETORES_VALIDOS, index=setor_index)
+
+    # Parse dos produtos
+    with st.spinner("🔍 Analisando produtos..."):
+        rows_all = parse_lince_lines_to_list(all_text)
+    
+    if not rows_all:
+        st.error("❌ Não consegui identificar produtos neste PDF.")
+        with st.expander("🔍 Ver texto extraído (debug)"):
+            st.code(all_text[:2000])
+        st.stop()
+
+    st.success(f"✅ {len(rows_all)} produtos detectados!")
+
+    # ----- Controles de Busca e Filtros -----
+    st.subheader("🔍 Busca e Filtros")
+    
+    col_search, col_order = st.columns([2, 1])
+    with col_search:
+        q = st.text_input("🔎 Buscar produto (contém):", value="").strip().upper()
+    with col_order:
+        order = st.selectbox("📊 Ordenar por", ["valor (desc)", "quantidade (desc)", "nome (A→Z)"], index=0)
+
+    # Aplica busca
+    if q:
+        rows = [r for r in rows_all if q in r["nome"].upper()]
+        if not rows:
+            st.warning(f"Nenhum produto encontrado com '{q}'")
+    else:
+        rows = rows_all[:]
+
+    # Aplica ordenação
+    if order.startswith("valor"):
+        rows.sort(key=lambda x: x["valor"], reverse=True)
+    elif order.startswith("quantidade"):
+        rows.sort(key=lambda x: x["quantidade"], reverse=True)
+    else:
+        rows.sort(key=lambda x: x["nome"])
+
+    # ----- Paginação -----
+    col_page1, col_page2, col_page3 = st.columns([1, 1, 2])
+    with col_page1:
+        page_size = st.selectbox("📄 Itens por página", [20, 50, 100], index=0)
+    
+    total = len(rows)
+    pages = max(1, ceil(total / page_size))
+    
+    with col_page2:
+        page = st.number_input("Página", min_value=1, max_value=pages, value=1, step=1)
+    with col_page3:
+        st.info(f"📊 **{total}** produtos encontrados (de {len(rows_all)} detectados)")
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = rows[start:end]
+
+    # ----- Seleção (checkboxes com session_state) -----
+    st.subheader("✅ Seleção de Produtos")
+    
+    if "selecao" not in st.session_state:
+        st.session_state.selecao = {}
+
+    # Inicializa chaves da página atual se não existirem
+    for r in page_rows:
+        st.session_state.selecao.setdefault(r["nome"], True)  # pré-selecionado
+
+    # Controles de seleção
+    col_sel1, col_sel2, col_sel3, col_sel4 = st.columns(4)
+    with col_sel1:
+        if st.button("✅ Selecionar todos (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = True
+    with col_sel2:
+        if st.button("❌ Limpar seleção (página)"):
+            for r in page_rows:
+                st.session_state.selecao[r["nome"]] = False
+    with col_sel3:
+        top_n = st.number_input("🎯 Top N por valor (global)", min_value=0, max_value=len(rows_all), value=10, step=1)
+    with col_sel4:
+        if st.button("🎯 Aplicar Top N"):
+            # Recria seleção: tudo False + Top N True
+            st.session_state.selecao = {r["nome"]: False for r in rows_all}
+            for r in rows_all[:top_n]:
+                st.session_state.selecao[r["nome"]] = True
+
+    # Info sobre seleção atual
+    selecionados_count = sum(1 for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    valor_selecionado = sum(r['valor'] for r in rows_all if st.session_state.selecao.get(r['nome'], False))
+    
+    if selecionados_count > 0:
+        st.info(f"📊 **{selecionados_count}** produtos selecionados | Valor total: **R$ {valor_selecionado:,.2f}**".replace(',', 'X').replace('.', ',').replace('X', '.'))
+
+    # ----- Tabela de Produtos -----
+    st.markdown("---")
+    
+    # Cabeçalho da "tabela"
+    hdr = st.container()
+    with hdr:
+        h1, h2, h3, h4 = st.columns([0.6, 4.5, 1.4, 1.5])
+        h1.markdown("**Sel.**")
+        h2.markdown("**Produto**")
+        h3.markdown("**Quantidade**")
+        h4.markdown("**Valor (R$)**")
+
+    # Linhas da página
+    box = st.container()
+    for r in page_rows:
+        nome = r["nome"]
+        qtd = round(float(r["quantidade"]), 3)
+        val = round(float(r["valor"]), 2)
+        csel, cprod, cqtd, cval = box.columns([0.6, 4.5, 1.4, 1.5])
+        st.session_state.selecao[nome] = csel.checkbox(
+            label="",
+            value=st.session_state.selecao.get(nome, True),
+            key=f"chk_{nome}_{page}"  # inclui página para evitar conflitos
+        )
+        cprod.text(nome)
+        cqtd.text(f"{qtd:,.3f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        cval.text(f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    # ----- Geração do Excel -----
+    st.markdown("---")
+    st.subheader("📊 Gerar Excel")
+    
+    col_excel1, col_excel2 = st.columns([3, 1])
+    
+    with col_excel2:
+        st.write("") # espaço
+        if st.button("📊 **Gerar Excel**", type="primary", use_container_width=True):
+            selecionados = [r for r in rows_all if st.session_state.selecao.get(r['nome'], False)]
+            if not selecionados:
+                st.warning("⚠️ Selecione pelo menos um produto.")
+                st.stop()
+
+            # Prepara arquivo Excel
+            output = io.BytesIO()
+            workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+            ws = workbook.add_worksheet("Produtos")
+
+            # Cabeçalhos conforme especificação
+            headers = ["nome do produto", "setor", "mês", "semana", "quantidade", "valor"]
+            for col, h in enumerate(headers):
+                ws.write(0, col, h)
+
+            # Dados dos produtos selecionados
+            for i, r in enumerate(selecionados, start=1):
+                ws.write(i, 0, r["nome"])
+                ws.write(i, 1, setor)
+                ws.write(i, 2, mes_selecionado)
+                ws.write(i, 3, semana)
+                ws.write_number(i, 4, round(float(r["quantidade"]), 3))
+                ws.write_number(i, 5, round(float(r["valor"]), 2))
+
+            # Formatação
+            fmt_money = workbook.add_format({'num_format': 'R$ #,##0.00'})
+            fmt_qty = workbook.add_format({'num_format': '#,##0.000'})
+            
+            ws.set_column(0, 0, 50)   # nome do produto
+            ws.set_column(1, 1, 18)   # setor
+            ws.set_column(2, 2, 15)   # mês
+            ws.set_column(3, 3, 10)   # semana
+            ws.set_column(4, 4, 15, fmt_qty)   # quantidade
+            ws.set_column(5, 5, 15, fmt_money) # valor
+
+            workbook.close()
+            
+            # Nome do arquivo conforme especificação
+            nome_arquivo = f"produtos_{setor.lower().replace(' ', '_')}_{mes_selecionado.lower()}_semana{semana}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            
+            st.success("✅ Excel gerado com sucesso!")
+            st.download_button(
+                label="⬇️ Baixar Excel",
+                data=output.getvalue(),
+                file_name=nome_arquivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with col_excel1:
+        if selecionados_count > 0:
+            st.write("**Preview do Excel:**")
+            preview_df = []
+            for r in rows_all[:5]:  # mostra apenas os 5 primeiros
+                if st.session_state.selecao.get(r['nome'], False):
+                    preview_df.append({
+                        "nome do produto": r["nome"],
+                        "setor": setor,
+                        "mês": mes_selecionado,
+                        "semana": semana,
+                        "quantidade": round(r["quantidade"], 3),
+                        "valor": round(r["valor"], 2)
+                    })
+            
+            if preview_df:
+                st.table(preview_df)
+                if len(preview_df) < selecionados_count:
+                    st.caption(f"... e mais {selecionados_count - len(preview_df)} produtos")
+
+else:
+    # Tela inicial com instruções
+    st.info("📋 **Como usar:**")
+    st.markdown("""
+    1. 📄 **Faça upload** do PDF com relatório 'Curva ABC' do sistema Lince
+    2. ⚙️ **Configure** o mês, semana e setor (detectado automaticamente)
+    3. 🔍 **Use a busca** para encontrar produtos específicos
+    4. ✅ **Selecione** os produtos que deseja exportar (use Top N para facilitar)
+    5. 📊 **Gere** o arquivo Excel com as colunas especificadas
+    
+    **Colunas do Excel:** nome do produto, setor, mês, semana, quantidade, valor
+    """)
+    
+    # Exemplo visual dos setores
+    st.markdown("---")
+    st.markdown("### 🏪 Setores Disponíveis:")
+    cols = st.columns(4)
+    for i, setor in enumerate(SETORES_VALIDOS):
+        cols[i % 4].markdown(f"• {setor}")
+, tokens[barcode_idx + 1]):
+            continue
+            
+        # Nome do produto começa após o código interno
+        nome_start = barcode_idx + 2
+        
+        # Encontra onde termina o nome (onde começam os números consecutivos)
+        nome_end = nome_start
+        for i in range(nome_start, len(tokens)):
+            if is_num_token(tokens[i]) and i + 1 < len(tokens) and is_num_token(tokens[i + 1]):
+                nome_end = i
+                break
+        
+        if nome_end == nome_start:
+            continue
+            
+        # Extrai nome e valores
+        nome = " ".join(tokens[nome_start:nome_end])
+        valores_tokens = tokens[nome_end:]
+        
+        if len(valores_tokens) < 3:  # precisa de pelo menos [custo, qtd, valor]
+            continue
+            
+        # Os primeiros 3 números após o nome são: custo, quantidade, valor
+        custo = br_to_float(valores_tokens[0])
+        quantidade = br_to_float(valores_tokens[1]) 
+        valor = br_to_float(valores_tokens[2])
+        
+        # Validações
+        if not nome or len(nome) < 3:
+            continue
+        if quantidade is None or quantidade <= 0:
+            continue
+        if valor is None or valor <= 0:
+            continue
         if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", nome):
             continue
-        
-        # Remove nome muito curto
-        if len(nome) < 3:
-            continue
+            
+        produtos.append({
+            "nome": nome,
+            "quantidade": float(quantidade),
+            "valor": float(valor)
+        })
 
-        items_raw.append({"nome": nome, "quantidade": float(qtd), "valor": float(valor)})
-
-    # 4) agrega por nome
+    # Agrupa por nome e ordena por valor
     agg = {}
-    for it in items_raw:
-        k = it["nome"]
-        if k not in agg:
-            agg[k] = {"nome": k, "quantidade": 0.0, "valor": 0.0}
-        agg[k]["quantidade"] += it["quantidade"]
-        agg[k]["valor"] += it["valor"]
+    for produto in produtos:
+        nome = produto["nome"]
+        if nome not in agg:
+            agg[nome] = {"nome": nome, "quantidade": 0.0, "valor": 0.0}
+        agg[nome]["quantidade"] += produto["quantidade"]
+        agg[nome]["valor"] += produto["valor"]
 
-    # 5) ordena por valor desc
     result = sorted(agg.values(), key=lambda x: x["valor"], reverse=True)
     return result
 
